@@ -1,0 +1,4 @@
+tdmclient
+
+# Standard library dependency (usually built-in, but good for environment locking)
+asyncio
