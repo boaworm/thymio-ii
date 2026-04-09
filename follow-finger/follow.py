@@ -7,14 +7,17 @@ from tdmclient import ClientAsync
 # Rear:   [5] [6]              (both on the back)
 
 # Configuration
-TURN_SPEED = 100
-FORWARD_SPEED = 100
-REVERSE_SPEED = 100
+MAX_SPEED = 150
+ROTATE_SPEED = 60      # Slower speed for rotation to avoid overshooting
 DETECTION_THRESHOLD = 50
-CENTERING_THRESHOLD = 50
 TARGET_DISTANCE = 3000
 TOO_CLOSE_THRESHOLD = 4000
 REAR_OBSTACLE_THRESHOLD = 1000
+ROTATE_THRESHOLD = 2000  # Above this, rotate in place instead of just turning
+FINE_THRESHOLD = 200   # Difference below which we consider ourselves centered
+
+# Control gain
+SPEED_GAIN = 0.1       # How speed adjusts based on distance error
 
 
 async def run_thymio(robot_addr=None, robot_port=None, use_ws=False, use_zeroconf=True):
@@ -50,7 +53,6 @@ async def run_thymio(robot_addr=None, robot_port=None, use_ws=False, use_zerocon
 
             front_sensors = sensors[:5]
             max_val = max(front_sensors)
-            target_index = front_sensors.index(max_val) if max_val > DETECTION_THRESHOLD else -1
 
             left_motor = 0
             right_motor = 0
@@ -58,36 +60,67 @@ async def run_thymio(robot_addr=None, robot_port=None, use_ws=False, use_zerocon
             if max_val > DETECTION_THRESHOLD:
                 center_value = sensors[2]
 
+                # Calculate forward speed based on distance to target
                 if center_value > TOO_CLOSE_THRESHOLD:
                     # Too close - reverse if rear clear
                     if not rear_blocked:
-                        left_motor = -REVERSE_SPEED
-                        right_motor = -REVERSE_SPEED
-                elif center_value > TARGET_DISTANCE:
-                    # A bit close - stop
-                    left_motor = 0
-                    right_motor = 0
-                else:
-                    # Good distance - move forward and center
-                    if target_index < 2:
-                        # Object on left - turn left
-                        left_motor = -TURN_SPEED
-                        right_motor = TURN_SPEED
-                    elif target_index > 2:
-                        # Object on right - turn right
-                        left_motor = TURN_SPEED
-                        right_motor = -TURN_SPEED
+                        speed = -MAX_SPEED
                     else:
-                        # Sensor 2 is strongest - move forward
-                        left_motor = FORWARD_SPEED
-                        right_motor = FORWARD_SPEED
+                        speed = 0
+                else:
+                    # Move forward, slower when closer to target
+                    distance_error = TARGET_DISTANCE - center_value
+                    speed = max(0, min(MAX_SPEED, distance_error * SPEED_GAIN))
+
+                # Check if we're mostly centered (sensor 2 is strongest)
+                if sensors[2] >= sensors[0] and sensors[2] >= sensors[1] and \
+                   sensors[2] >= sensors[3] and sensors[2] >= sensors[4]:
+                    # Mostly centered - check if fine adjustment needed
+                    fine_diff = sensors[1] - sensors[3]
+                    if abs(fine_diff) < FINE_THRESHOLD:
+                        # Well centered - just move forward
+                        left_motor = int(speed)
+                        right_motor = int(speed)
+                    else:
+                        # Slightly off - apply small correction
+                        correction = fine_diff * 0.005
+                        left_motor = int(speed - correction)
+                        right_motor = int(speed + correction)
+                else:
+                    # Not centered - calculate left/right imbalance
+                    # Sensors 0,1 are on the left; sensors 3,4 are on the right
+                    left_sum = sensors[0] + sensors[1]
+                    right_sum = sensors[3] + sensors[4]
+
+                    if left_sum > right_sum:
+                        # Finger is on the left - turn left
+                        if left_sum > ROTATE_THRESHOLD:
+                            # Rotate in place (slower speed)
+                            left_motor = -ROTATE_SPEED
+                            right_motor = ROTATE_SPEED
+                        else:
+                            # Both forward, right faster - scale by error
+                            diff = left_sum - right_sum
+                            left_motor = int(speed - diff * 0.005)
+                            right_motor = int(speed + diff * 0.005)
+                    else:
+                        # Finger is on the right - turn right
+                        if right_sum > ROTATE_THRESHOLD:
+                            # Rotate in place (slower speed)
+                            left_motor = ROTATE_SPEED
+                            right_motor = -ROTATE_SPEED
+                        else:
+                            # Both forward, left faster - scale by error
+                            diff = right_sum - left_sum
+                            left_motor = int(speed + diff * 0.005)
+                            right_motor = int(speed - diff * 0.005)
 
             await node.set_variables({
                 "motor.left.target": [left_motor],
                 "motor.right.target": [right_motor]
             })
 
-            await client.sleep(0.1)
+            await client.sleep(0.3)
 
     except KeyboardInterrupt:
         print("\nStopping...")
