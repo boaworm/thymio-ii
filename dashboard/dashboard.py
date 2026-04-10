@@ -30,8 +30,14 @@ async def run_dashboard():
             print("-" * 40)
 
             # 3. Ground Proximity
+            for i, val in enumerate(node.v.prox.ground.ambiant):
+                name = f"Prox Ground Ambient [{i}]"
+                print(f"{name:<20} | {val:<15}")
             for i, val in enumerate(node.v.prox.ground.reflected):
-                name = f"Prox Ground [{i}]"
+                name = f"Prox Ground Reflected [{i}]"
+                print(f"{name:<20} | {val:<15}")
+            for i, val in enumerate(node.v.prox.ground.delta):
+                name = f"Prox Ground Delta [{i}]"
                 print(f"{name:<20} | {val:<15}")
 
             print("-" * 40)
