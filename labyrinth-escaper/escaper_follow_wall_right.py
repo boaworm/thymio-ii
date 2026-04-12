@@ -49,10 +49,9 @@ onevent timer0
 
 
 async def setup_watchdog(node):
+    """Skip watchdog for stability."""
     await node.stop()
-    await node.compile(WATCHDOG_PROGRAM, load=True)
-    await node.run()
-    print("Watchdog loaded")
+    print("Watchdog skipped")
 
 
 async def play_freq(node, freq, duration_60ths=12):
@@ -66,7 +65,6 @@ async def set_motors(node, left, right):
     await node.set_variables({
         "motor.left.target":  [int(left)],
         "motor.right.target": [int(right)],
-        "watchdog": [10],
     })
 
 
@@ -125,7 +123,7 @@ async def phase2_escape(node, client):
                 state = "RETREAT"
             elif blocked_ticks > STUCK_TICKS + RETREAT_TICKS:
                 rear = list(sensors[5:7])
-                rear_blocked = max(rear) > WALL_CLOSE
+                rear_blocked = max(rear) > 3500  # rear must be VERY close
                 if not rear_blocked:
                     left_motor  = -FORWARD_SPEED
                     right_motor = -FORWARD_SPEED
@@ -231,8 +229,12 @@ async def run_thymio(robot_addr=None, robot_port=None, use_ws=False, use_zerocon
                 await phase2_escape(node, client)
                 await phase3_celebrate(node)
                 return
-            except DisconnectedError:
-                print("\nTDM disconnected — reconnecting...")
+            except DisconnectedError as e:
+                print(f"\nTDM disconnected ({e}) — reconnecting...")
+                client, node = await connect(kwargs)
+                startup_done = True
+            except Exception as e:
+                print(f"\nError ({e}) — reconnecting...")
                 client, node = await connect(kwargs)
                 startup_done = True
     except KeyboardInterrupt:
