@@ -10,9 +10,10 @@ from tdmclient.client import DisconnectedError
 # Scale: 0 = nothing, ~5000 = touching (higher = closer)
 
 # Detection thresholds
-CLEAR_THRESHOLD  = 80    # below this, sensor is effectively "clear"
-NEAR_THRESHOLD   = 1200  # something nearby — start steering away
-BLOCK_THRESHOLD  = 2800  # something in the way — stop & rotate in place
+CLEAR_THRESHOLD   = 80    # below this, sensor is effectively "clear"
+NEAR_THRESHOLD    = 1200  # something nearby — start steering away
+BLOCK_THRESHOLD   = 2800  # something in the way — stop & rotate in place
+REAR_OBSTACLE_THRESHOLD = 3500  # rear must be VERY close to block movement
 
 # Speeds
 FORWARD_SPEED = 120
@@ -51,11 +52,9 @@ onevent timer0
 
 
 async def setup_watchdog(node):
-    """Load a watchdog program that stops motors on disconnect."""
+    """Skip watchdog - just run directly."""
     await node.stop()
-    await node.compile(WATCHDOG_PROGRAM, load=True)
-    await node.run()
-    print("Watchdog loaded")
+    print("Watchdog skipped")
 
 
 async def play_freq(node, freq, duration_60ths=12):
@@ -69,7 +68,6 @@ async def set_motors(node, left, right):
     await node.set_variables({
         "motor.left.target":  [int(left)],
         "motor.right.target": [int(right)],
-        "watchdog": [10],
     })
 
 
@@ -85,6 +83,7 @@ async def phase2_escape(node, client):
     t0 = time.monotonic()
     rotate_ticks = 0
     tilt_ticks = 0
+    turning_right = True  # start by turning right
 
     while True:
         await node.wait_for_variables({"prox.horizontal", "acc"})
@@ -107,49 +106,51 @@ async def phase2_escape(node, client):
         max_front = max(front)
         left_sum  = front[0] + front[1]
         right_sum = front[3] + front[4]
-        front_blocked = (
-            front[0] > BLOCK_THRESHOLD or
-            front[1] > BLOCK_THRESHOLD or
-            front[2] > BLOCK_THRESHOLD or
-            front[3] > BLOCK_THRESHOLD or
-            front[4] > BLOCK_THRESHOLD
-        )
+        right_clear = front[3] < NEAR_THRESHOLD and front[4] < NEAR_THRESHOLD
+        left_clear  = front[0] < NEAR_THRESHOLD and front[1] < NEAR_THRESHOLD
+        front_blocked = max_front > BLOCK_THRESHOLD
 
         if front_blocked:
             rotate_ticks += 1
 
             if rotate_ticks <= RETREAT_TICKS:
-                # Phase 1: reverse to pull front away from wall.
+                # Reverse first to pull away from wall
                 left_motor  = -FORWARD_SPEED
                 right_motor = -FORWARD_SPEED
-            elif rotate_ticks > STUCK_ROTATE_TICKS + RETREAT_TICKS:
-                # Stuck — extended reverse if rear clear.
-                rear_blocked = max(rear) > NEAR_THRESHOLD
-                if not rear_blocked:
-                    left_motor  = -FORWARD_SPEED
-                    right_motor = -FORWARD_SPEED
-                    if rotate_ticks >= STUCK_ROTATE_TICKS + RETREAT_TICKS + REVERSE_TICKS:
-                        rotate_ticks = 0
-                else:
-                    left_motor, right_motor = TURN_SPEED, -TURN_SPEED
-            elif left_sum <= right_sum:
-                # Phase 2: rotate toward freer side.
-                left_motor  = -TURN_SPEED
-                right_motor =  TURN_SPEED
             else:
-                left_motor  =  TURN_SPEED
-                right_motor = -TURN_SPEED
+                # Rotate in direction until that side is clear
+                if turning_right:
+                    left_motor  = -TURN_SPEED
+                    right_motor =  TURN_SPEED
+                    # Switch to left if right still blocked after lots of rotation
+                    if not right_clear and rotate_ticks > STUCK_ROTATE_TICKS:
+                        turning_right = False
+                        rotate_ticks = RETREAT_TICKS + 1
+                else:
+                    left_motor  =  TURN_SPEED
+                    right_motor = -TURN_SPEED
+                    # Switch back to right if left still blocked
+                    if not left_clear and rotate_ticks > STUCK_ROTATE_TICKS:
+                        turning_right = True
+                        rotate_ticks = RETREAT_TICKS + 1
+
+                # Once either side clear, move forward
+                if (right_clear or left_clear) and rotate_ticks > RETREAT_TICKS:
+                    rotate_ticks = 0
+                    turning_right = True  # reset
+                    left_motor  = FORWARD_SPEED
+                    right_motor = FORWARD_SPEED
 
         elif max_front > NEAR_THRESHOLD:
-            # Something nearby but not blocking — steer around it while moving.
+            # Something nearby — steer around it
             rotate_ticks = 0
-            diff = left_sum - right_sum  # +: obstacle on left → bias right
+            diff = left_sum - right_sum
             correction = diff * STEER_GAIN
             left_motor  = FORWARD_SPEED + correction
             right_motor = FORWARD_SPEED - correction
 
         else:
-            # Clear (or faint) readings — just roll forward.
+            # Completely clear — roll forward
             rotate_ticks = 0
             left_motor  = FORWARD_SPEED
             right_motor = FORWARD_SPEED
@@ -159,7 +160,7 @@ async def phase2_escape(node, client):
         t = time.monotonic() - t0
         print(
             f"[{t:6.1f}s] front={front} rear={rear} acc={acc} "
-            f"tilt={tilt_ticks} rot={rotate_ticks} "
+            f"tilt={tilt_ticks} rot={rotate_ticks} R={right_clear} L={left_clear} turn={'R' if turning_right else 'L'} "
             f"L/R={int(left_motor)}/{int(right_motor)}"
         )
 
@@ -173,11 +174,14 @@ async def phase3_celebrate(node):
 
 
 async def connect(kwargs):
+    """Connect to TDM and robot with retry logic."""
     while True:
         client = ClientAsync(**kwargs)
         try:
             node = await asyncio.wait_for(client.wait_for_node(), timeout=10.0)
             await node.lock()
+            # Enable variable watching for push-based updates
+            await node.watch(variables=True)
             print(f"Connected to {node.id}")
             return client, node
         except (asyncio.TimeoutError, Exception) as e:
@@ -209,8 +213,12 @@ async def run_thymio(robot_addr=None, robot_port=None, use_ws=False, use_zerocon
                 await phase2_escape(node, client)
                 await phase3_celebrate(node)
                 return
-            except DisconnectedError:
-                print("\nTDM disconnected — reconnecting...")
+            except DisconnectedError as e:
+                print(f"\nTDM disconnected ({e}) — reconnecting...")
+                client, node = await connect(kwargs)
+                startup_done = True
+            except Exception as e:
+                print(f"\nError ({e}) — reconnecting...")
                 client, node = await connect(kwargs)
                 startup_done = True
     except KeyboardInterrupt:

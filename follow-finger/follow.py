@@ -1,6 +1,7 @@
 import asyncio
 import argparse
 from tdmclient import ClientAsync
+from tdmclient.client import DisconnectedError
 
 # Sensor layout on Thymio II:
 # Front:  [0] [1] [2] [3] [4]  (0=far left, 2=center, 4=far right)
@@ -20,6 +21,118 @@ FINE_THRESHOLD = 200   # Difference below which we consider ourselves centered
 SPEED_GAIN = 0.1       # How speed adjusts based on distance error
 
 
+class ThymioFollower:
+    """Thymio finger follower using listener-based sensor updates."""
+
+    def __init__(self, node):
+        self.node = node
+        self.running = False
+        self.sensors = None
+        self._stop_event = asyncio.Event()
+
+    async def connect(self):
+        """Wait for node and set up sensor listening."""
+        await self.node.lock()
+        # Enable variable watching
+        await self.node.watch(variables=True)
+        # Add listener for sensor updates
+        self.node.add_variables_changed_listener(self._on_sensors_changed)
+        # Wait for initial sensor data
+        await self.node.wait_for_variables({"prox.horizontal"})
+        print(f"Connected to {self.node.id}")
+        print("Press Ctrl+C to stop\n")
+
+    def _on_sensors_changed(self, node, variables):
+        """Callback when sensor variables change."""
+        if "prox.horizontal" in variables:
+            self.sensors = list(variables["prox.horizontal"])
+            if self.running:
+                self._process_sensors()
+
+    def _process_sensors(self):
+        """Calculate motor speeds from current sensors."""
+        if self.sensors is None:
+            return
+
+        rear_blocked = (self.sensors[5] > REAR_OBSTACLE_THRESHOLD or
+                       self.sensors[6] > REAR_OBSTACLE_THRESHOLD)
+        max_val = max(self.sensors[:5])
+
+        left_motor = 0
+        right_motor = 0
+
+        if max_val > DETECTION_THRESHOLD:
+            center_value = self.sensors[2]
+
+            if center_value > TOO_CLOSE_THRESHOLD:
+                if not rear_blocked:
+                    speed = -MAX_SPEED
+                else:
+                    speed = 0
+            else:
+                distance_error = TARGET_DISTANCE - center_value
+                speed = max(0, min(MAX_SPEED, distance_error * SPEED_GAIN))
+
+            if (self.sensors[2] >= self.sensors[0] and
+                self.sensors[2] >= self.sensors[1] and
+                self.sensors[2] >= self.sensors[3] and
+                self.sensors[2] >= self.sensors[4]):
+                fine_diff = self.sensors[1] - self.sensors[3]
+                if abs(fine_diff) < FINE_THRESHOLD:
+                    left_motor = int(speed)
+                    right_motor = int(speed)
+                else:
+                    correction = fine_diff * 0.005
+                    left_motor = int(speed - correction)
+                    right_motor = int(speed + correction)
+            else:
+                left_sum = self.sensors[0] + self.sensors[1]
+                right_sum = self.sensors[3] + self.sensors[4]
+
+                if left_sum > right_sum:
+                    if left_sum > ROTATE_THRESHOLD:
+                        left_motor = -ROTATE_SPEED
+                        right_motor = ROTATE_SPEED
+                    else:
+                        diff = left_sum - right_sum
+                        left_motor = int(speed - diff * 0.005)
+                        right_motor = int(speed + diff * 0.005)
+                else:
+                    if right_sum > ROTATE_THRESHOLD:
+                        left_motor = ROTATE_SPEED
+                        right_motor = -ROTATE_SPEED
+                    else:
+                        diff = right_sum - left_sum
+                        left_motor = int(speed + diff * 0.005)
+                        right_motor = int(speed - diff * 0.005)
+
+        asyncio.create_task(self._set_motors(left_motor, right_motor))
+
+    async def _set_motors(self, left, right):
+        """Set motor speeds."""
+        try:
+            await self.node.set_variables({
+                "motor.left.target": [left],
+                "motor.right.target": [right]
+            })
+        except Exception:
+            pass
+
+    async def stop(self):
+        """Stop motors and clean up."""
+        try:
+            await self.node.set_variables({
+                "motor.left.target": [0],
+                "motor.right.target": [0]
+            })
+        except Exception:
+            pass
+        try:
+            await self.node.unlock()
+        except Exception:
+            pass
+
+
 async def run_thymio(robot_addr=None, robot_port=None, use_ws=False, use_zeroconf=True):
     kwargs = {}
     if robot_addr:
@@ -32,112 +145,28 @@ async def run_thymio(robot_addr=None, robot_port=None, use_ws=False, use_zerocon
         kwargs["zeroconf"] = True
 
     client = ClientAsync(**kwargs)
+    follower = None
 
     try:
         node = await asyncio.wait_for(client.wait_for_node(), timeout=10.0)
+        follower = ThymioFollower(node)
+        await follower.connect()
+        follower.running = True
+
+        # Keep running until interrupted
+        await follower._stop_event.wait()
+
     except asyncio.TimeoutError:
         print("ERROR: Timeout waiting for robot. Is it powered on and in range?")
-        return
-
-    await node.lock()
-
-    print(f"Connected to {node.id}")
-    print("Press Ctrl+C to stop\n")
-
-    try:
-        while True:
-            await node.wait_for_variables({"prox.horizontal"})
-            sensors = node.v.prox.horizontal
-
-            rear_blocked = sensors[5] > REAR_OBSTACLE_THRESHOLD or sensors[6] > REAR_OBSTACLE_THRESHOLD
-
-            front_sensors = sensors[:5]
-            max_val = max(front_sensors)
-
-            left_motor = 0
-            right_motor = 0
-
-            if max_val > DETECTION_THRESHOLD:
-                center_value = sensors[2]
-
-                # Calculate forward speed based on distance to target
-                if center_value > TOO_CLOSE_THRESHOLD:
-                    # Too close - reverse if rear clear
-                    if not rear_blocked:
-                        speed = -MAX_SPEED
-                    else:
-                        speed = 0
-                else:
-                    # Move forward, slower when closer to target
-                    distance_error = TARGET_DISTANCE - center_value
-                    speed = max(0, min(MAX_SPEED, distance_error * SPEED_GAIN))
-
-                # Check if we're mostly centered (sensor 2 is strongest)
-                if sensors[2] >= sensors[0] and sensors[2] >= sensors[1] and \
-                   sensors[2] >= sensors[3] and sensors[2] >= sensors[4]:
-                    # Mostly centered - check if fine adjustment needed
-                    fine_diff = sensors[1] - sensors[3]
-                    if abs(fine_diff) < FINE_THRESHOLD:
-                        # Well centered - just move forward
-                        left_motor = int(speed)
-                        right_motor = int(speed)
-                    else:
-                        # Slightly off - apply small correction
-                        correction = fine_diff * 0.005
-                        left_motor = int(speed - correction)
-                        right_motor = int(speed + correction)
-                else:
-                    # Not centered - calculate left/right imbalance
-                    # Sensors 0,1 are on the left; sensors 3,4 are on the right
-                    left_sum = sensors[0] + sensors[1]
-                    right_sum = sensors[3] + sensors[4]
-
-                    if left_sum > right_sum:
-                        # Finger is on the left - turn left
-                        if left_sum > ROTATE_THRESHOLD:
-                            # Rotate in place (slower speed)
-                            left_motor = -ROTATE_SPEED
-                            right_motor = ROTATE_SPEED
-                        else:
-                            # Both forward, right faster - scale by error
-                            diff = left_sum - right_sum
-                            left_motor = int(speed - diff * 0.005)
-                            right_motor = int(speed + diff * 0.005)
-                    else:
-                        # Finger is on the right - turn right
-                        if right_sum > ROTATE_THRESHOLD:
-                            # Rotate in place (slower speed)
-                            left_motor = ROTATE_SPEED
-                            right_motor = -ROTATE_SPEED
-                        else:
-                            # Both forward, left faster - scale by error
-                            diff = right_sum - left_sum
-                            left_motor = int(speed + diff * 0.005)
-                            right_motor = int(speed - diff * 0.005)
-
-            await node.set_variables({
-                "motor.left.target": [left_motor],
-                "motor.right.target": [right_motor]
-            })
-
-            await client.sleep(0.3)
-
     except KeyboardInterrupt:
         print("\nStopping...")
+    except DisconnectedError:
+        print("\nDisconnected from TDM")
     except Exception as e:
         print(f"\nError: {e}")
     finally:
-        try:
-            await node.set_variables({
-                "motor.left.target": [0],
-                "motor.right.target": [0]
-            })
-        except:
-            pass
-        try:
-            await node.unlock()
-        except:
-            pass
+        if follower:
+            await follower.stop()
 
 
 if __name__ == "__main__":
