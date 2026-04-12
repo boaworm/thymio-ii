@@ -1,6 +1,8 @@
 import asyncio
 import argparse
+import time
 from tdmclient import ClientAsync
+from tdmclient.client import DisconnectedError
 
 # Sensor layout on Thymio II:
 # Front:  [0] [1] [2] [3] [4]  (0=far left, 2=center, 4=far right)
@@ -14,21 +16,43 @@ BLOCK_THRESHOLD = 2800  # wall ahead — must turn
 
 # Speeds
 FORWARD_SPEED = 120
-TURN_SPEED    = 110
+TURN_INNER    = 30   # wall-side wheel: slow forward arc
+TURN_OUTER    = 120  # far-side wheel: drives the turn
 
 # Proportional correction to maintain wall distance while cruising
 WALL_GAIN = 0.03
 
 # Loop timing
-LOOP_DT = 0.1   # 10 Hz
+LOOP_DT = 0.2   # 5 Hz — slower to avoid flooding the wireless TDM link
 
 # Escape condition: accelerometer Y >= threshold for N consecutive ticks.
 ACC_Y_THRESHOLD   = 2
 ACC_CONFIRM_TICKS = 4
 
 # Stuck detection: if blocked for this many ticks, reverse briefly.
+RETREAT_TICKS = 4    # reverse before turning to pull front away from wall
 STUCK_TICKS   = 15   # ~1.5s of spinning without clearing
 REVERSE_TICKS = 8    # ~0.8s of backing up
+
+
+WATCHDOG_PROGRAM = """\
+var watchdog = 0
+timer.period[0] = 300
+onevent timer0
+  if watchdog > 0 then
+    watchdog = watchdog - 1
+  else
+    motor.left.target = 0
+    motor.right.target = 0
+  end
+"""
+
+
+async def setup_watchdog(node):
+    await node.stop()
+    await node.compile(WATCHDOG_PROGRAM, load=True)
+    await node.run()
+    print("Watchdog loaded")
 
 
 async def play_freq(node, freq, duration_60ths=12):
@@ -42,6 +66,7 @@ async def set_motors(node, left, right):
     await node.set_variables({
         "motor.left.target":  [int(left)],
         "motor.right.target": [int(right)],
+        "watchdog": [10],
     })
 
 
@@ -54,8 +79,11 @@ async def phase1_startup(node):
 async def phase2_escape(node, client):
     """Right-hand rule: keep a wall on the right side."""
     print("Phase 2: escaping (right-hand wall follower)")
+    await setup_watchdog(node)
+    t0 = time.monotonic()
     tilt_ticks = 0
     blocked_ticks = 0
+    had_right_wall = False   # tracks whether we've been following a wall
 
     while True:
         await node.wait_for_variables({"prox.horizontal", "acc"})
@@ -83,73 +111,76 @@ async def phase2_escape(node, client):
         )
         has_right_wall  = right_sum > WALL_DETECT
         right_too_close = right_sum > WALL_CLOSE
+        right_blocked   = front[4] > BLOCK_THRESHOLD  # wall-side sensor dangerously close
 
         # --- Right-hand rule ---
-        # Priority: blocked ahead → turn left
-        #           no wall on right but walls nearby → turn right to regain it
-        #           no walls anywhere → drive forward to find walls
-        #           wall on right → cruise forward with distance correction
-        anything_nearby = max(front) > WALL_DETECT
-
-        if front_blocked:
+        if front_blocked or right_blocked:
             blocked_ticks += 1
+            had_right_wall = True  # wall ahead counts as "had wall"
 
-            if blocked_ticks > STUCK_TICKS:
-                # Stuck spinning — back up to make room.
+            if blocked_ticks <= RETREAT_TICKS:
+                # Phase 1: reverse to pull front away from wall.
+                left_motor  = -FORWARD_SPEED
+                right_motor = -FORWARD_SPEED
+                state = "RETREAT"
+            elif blocked_ticks > STUCK_TICKS + RETREAT_TICKS:
                 rear = list(sensors[5:7])
                 rear_blocked = max(rear) > WALL_CLOSE
                 if not rear_blocked:
                     left_motor  = -FORWARD_SPEED
                     right_motor = -FORWARD_SPEED
                     state = "STUCK→reverse"
-                    if blocked_ticks >= STUCK_TICKS + REVERSE_TICKS:
+                    if blocked_ticks >= STUCK_TICKS + RETREAT_TICKS + REVERSE_TICKS:
                         blocked_ticks = 0
                 else:
-                    left_motor  = -TURN_SPEED
-                    right_motor =  TURN_SPEED
-                    state = "STUCK→spin"
+                    left_motor  = TURN_INNER
+                    right_motor = TURN_OUTER
+                    state = "STUCK→arc_left"
             else:
-                # Wall ahead — turn left (away from our followed right wall).
-                left_motor  = -TURN_SPEED
-                right_motor =  TURN_SPEED
+                # Phase 2: arc left — wall is on right, so right=fast left=slow.
+                left_motor  = TURN_INNER
+                right_motor = TURN_OUTER
                 state = "BLOCKED→left"
 
-        else:
+        elif not has_right_wall and had_right_wall:
+            # Had the wall, just lost it — arc right to hug around corner.
+            # Wall side (right) goes slow, far side (left) goes fast.
+            left_motor  = TURN_OUTER
+            right_motor = TURN_INNER
+            state = "HUG→right"
+
+        elif not has_right_wall:
+            # Never had a wall — drive forward to find one.
             blocked_ticks = 0
+            left_motor  = FORWARD_SPEED
+            right_motor = FORWARD_SPEED
+            state = "SEEK_WALL"
 
-            if not has_right_wall and anything_nearby:
-                # Lost the right wall but other walls nearby (corner) — turn right.
-                left_motor  =  TURN_SPEED
-                right_motor = -TURN_SPEED
-                state = "CORNER→right"
+        elif right_too_close:
+            # Too close to the right wall — steer left while moving forward.
+            blocked_ticks = 0
+            had_right_wall = True
+            correction = (right_sum - WALL_CLOSE) * WALL_GAIN
+            left_motor  = FORWARD_SPEED - correction
+            right_motor = FORWARD_SPEED + correction
+            state = "TOO_CLOSE→nudge_left"
 
-            elif not has_right_wall:
-                # Nothing in sensor range — drive forward to find walls.
-                left_motor  = FORWARD_SPEED
-                right_motor = FORWARD_SPEED
-                state = "SEEK_WALL"
-
-            elif right_too_close:
-                # Too close to the right wall — steer left while moving forward.
-                correction = (right_sum - WALL_CLOSE) * WALL_GAIN
-                left_motor  = FORWARD_SPEED - correction
-                right_motor = FORWARD_SPEED + correction
-                state = "TOO_CLOSE→nudge_left"
-
-            else:
-                # Cruising with wall on right at a good distance.
-                # Small proportional correction to hold distance.
-                target = (WALL_DETECT + WALL_CLOSE) // 2
-                error = right_sum - target
-                correction = error * WALL_GAIN
-                left_motor  = FORWARD_SPEED - correction
-                right_motor = FORWARD_SPEED + correction
-                state = "FOLLOW"
+        else:
+            # Cruising with wall on right at a good distance.
+            blocked_ticks = 0
+            had_right_wall = True
+            target = (WALL_DETECT + WALL_CLOSE) // 2
+            error = right_sum - target
+            correction = error * WALL_GAIN
+            left_motor  = FORWARD_SPEED - correction
+            right_motor = FORWARD_SPEED + correction
+            state = "FOLLOW"
 
         await set_motors(node, left_motor, right_motor)
 
+        t = time.monotonic() - t0
         print(
-            f"front={front} L={left_sum} R={right_sum} "
+            f"[{t:6.1f}s] front={front} L={left_sum} R={right_sum} "
             f"acc={acc} tilt={tilt_ticks} "
             f"state={state} L/R={int(left_motor)}/{int(right_motor)}"
         )
@@ -163,6 +194,19 @@ async def phase3_celebrate(node):
         await play_freq(node, freq, dur)
 
 
+async def connect(kwargs):
+    while True:
+        client = ClientAsync(**kwargs)
+        try:
+            node = await asyncio.wait_for(client.wait_for_node(), timeout=10.0)
+            await node.lock()
+            print(f"Connected to {node.id}")
+            return client, node
+        except (asyncio.TimeoutError, Exception) as e:
+            print(f"Connection failed ({e}), retrying in 2s...")
+            await asyncio.sleep(2)
+
+
 async def run_thymio(robot_addr=None, robot_port=None, use_ws=False, use_zeroconf=True):
     kwargs = {}
     if robot_addr:
@@ -174,25 +218,25 @@ async def run_thymio(robot_addr=None, robot_port=None, use_ws=False, use_zerocon
     if use_zeroconf:
         kwargs["zeroconf"] = True
 
-    client = ClientAsync(**kwargs)
-    try:
-        node = await asyncio.wait_for(client.wait_for_node(), timeout=10.0)
-    except asyncio.TimeoutError:
-        print("Timeout: could not connect to Thymio")
-        return
-
-    await node.lock()
-    print(f"Connected to {node.id}")
+    client, node = await connect(kwargs)
     print("Press Ctrl+C to stop\n")
 
+    startup_done = False
     try:
-        await phase1_startup(node)
-        await phase2_escape(node, client)
-        await phase3_celebrate(node)
+        while True:
+            try:
+                if not startup_done:
+                    await phase1_startup(node)
+                    startup_done = True
+                await phase2_escape(node, client)
+                await phase3_celebrate(node)
+                return
+            except DisconnectedError:
+                print("\nTDM disconnected — reconnecting...")
+                client, node = await connect(kwargs)
+                startup_done = True
     except KeyboardInterrupt:
         print("\nStopped by user.")
-    except Exception as e:
-        print(f"\nError: {e}")
     finally:
         try:
             await set_motors(node, 0, 0)
@@ -202,6 +246,11 @@ async def run_thymio(robot_addr=None, robot_port=None, use_ws=False, use_zerocon
             await node.unlock()
         except Exception:
             pass
+        try:
+            client.close()
+        except Exception:
+            pass
+        print("Cleaned up.")
 
 
 if __name__ == "__main__":

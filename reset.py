@@ -34,6 +34,7 @@ async def run_thymio(robot_addr=None, robot_port=None, use_ws=False, use_zerocon
     await asyncio.sleep(0.5)
 
     await node.unlock()
+    client.close()
     print("Reset done.")
 
 

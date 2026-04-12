@@ -1,6 +1,8 @@
 import asyncio
 import argparse
+import time
 from tdmclient import ClientAsync
+from tdmclient.client import DisconnectedError
 
 # Sensor layout on Thymio II:
 # Front:  [0] [1] [2] [3] [4]  (0=far left, 2=center, 4=far right)
@@ -20,7 +22,7 @@ TURN_SPEED    = 110
 STEER_GAIN = 0.04
 
 # Loop timing
-LOOP_DT = 0.1   # 10 Hz
+LOOP_DT = 0.2   # 5 Hz — slower to avoid flooding the wireless TDM link
 
 # Escape condition: accelerometer Y reads >= this value for several ticks in a
 # row (robot has been tilted — "lifted to victory").
@@ -29,8 +31,31 @@ ACC_CONFIRM_TICKS  = 4
 
 # Safety: if we've been rotating in place for this long without finding a way
 # out, nudge backwards briefly to unstick (dead-end recovery).
+RETREAT_TICKS      = 4    # reverse before turning to pull front away from wall
 STUCK_ROTATE_TICKS = 40
 REVERSE_TICKS      = 6
+
+
+# On-board watchdog: stops motors if Python stops refreshing within ~1s.
+WATCHDOG_PROGRAM = """\
+var watchdog = 0
+timer.period[0] = 300
+onevent timer0
+  if watchdog > 0 then
+    watchdog = watchdog - 1
+  else
+    motor.left.target = 0
+    motor.right.target = 0
+  end
+"""
+
+
+async def setup_watchdog(node):
+    """Load a watchdog program that stops motors on disconnect."""
+    await node.stop()
+    await node.compile(WATCHDOG_PROGRAM, load=True)
+    await node.run()
+    print("Watchdog loaded")
 
 
 async def play_freq(node, freq, duration_60ths=12):
@@ -44,6 +69,7 @@ async def set_motors(node, left, right):
     await node.set_variables({
         "motor.left.target":  [int(left)],
         "motor.right.target": [int(right)],
+        "watchdog": [10],
     })
 
 
@@ -55,6 +81,8 @@ async def phase1_startup(node):
 
 async def phase2_escape(node, client):
     print("Phase 2: escaping")
+    await setup_watchdog(node)
+    t0 = time.monotonic()
     rotate_ticks = 0
     tilt_ticks = 0
 
@@ -80,32 +108,35 @@ async def phase2_escape(node, client):
         left_sum  = front[0] + front[1]
         right_sum = front[3] + front[4]
         front_blocked = (
+            front[0] > BLOCK_THRESHOLD or
             front[1] > BLOCK_THRESHOLD or
             front[2] > BLOCK_THRESHOLD or
-            front[3] > BLOCK_THRESHOLD
+            front[3] > BLOCK_THRESHOLD or
+            front[4] > BLOCK_THRESHOLD
         )
 
         if front_blocked:
-            # Wall directly ahead — rotate in place toward the freer side.
             rotate_ticks += 1
 
-            if rotate_ticks > STUCK_ROTATE_TICKS:
-                # Stuck spinning — back up briefly if the rear is clear.
+            if rotate_ticks <= RETREAT_TICKS:
+                # Phase 1: reverse to pull front away from wall.
+                left_motor  = -FORWARD_SPEED
+                right_motor = -FORWARD_SPEED
+            elif rotate_ticks > STUCK_ROTATE_TICKS + RETREAT_TICKS:
+                # Stuck — extended reverse if rear clear.
                 rear_blocked = max(rear) > NEAR_THRESHOLD
                 if not rear_blocked:
                     left_motor  = -FORWARD_SPEED
                     right_motor = -FORWARD_SPEED
-                    if rotate_ticks >= STUCK_ROTATE_TICKS + REVERSE_TICKS:
-                        rotate_ticks = 0  # try rotating again after reversing
+                    if rotate_ticks >= STUCK_ROTATE_TICKS + RETREAT_TICKS + REVERSE_TICKS:
+                        rotate_ticks = 0
                 else:
-                    # Rear blocked too — keep spinning and hope for the best.
                     left_motor, right_motor = TURN_SPEED, -TURN_SPEED
             elif left_sum <= right_sum:
-                # More obstacle on the right → turn left (away from it).
+                # Phase 2: rotate toward freer side.
                 left_motor  = -TURN_SPEED
                 right_motor =  TURN_SPEED
             else:
-                # More obstacle on the left → turn right.
                 left_motor  =  TURN_SPEED
                 right_motor = -TURN_SPEED
 
@@ -125,8 +156,9 @@ async def phase2_escape(node, client):
 
         await set_motors(node, left_motor, right_motor)
 
+        t = time.monotonic() - t0
         print(
-            f"front={front} rear={rear} acc={acc} "
+            f"[{t:6.1f}s] front={front} rear={rear} acc={acc} "
             f"tilt={tilt_ticks} rot={rotate_ticks} "
             f"L/R={int(left_motor)}/{int(right_motor)}"
         )
@@ -140,6 +172,19 @@ async def phase3_celebrate(node):
         await play_freq(node, freq, dur)
 
 
+async def connect(kwargs):
+    while True:
+        client = ClientAsync(**kwargs)
+        try:
+            node = await asyncio.wait_for(client.wait_for_node(), timeout=10.0)
+            await node.lock()
+            print(f"Connected to {node.id}")
+            return client, node
+        except (asyncio.TimeoutError, Exception) as e:
+            print(f"Connection failed ({e}), retrying in 2s...")
+            await asyncio.sleep(2)
+
+
 async def run_thymio(robot_addr=None, robot_port=None, use_ws=False, use_zeroconf=True):
     kwargs = {}
     if robot_addr:
@@ -151,25 +196,25 @@ async def run_thymio(robot_addr=None, robot_port=None, use_ws=False, use_zerocon
     if use_zeroconf:
         kwargs["zeroconf"] = True
 
-    client = ClientAsync(**kwargs)
-    try:
-        node = await asyncio.wait_for(client.wait_for_node(), timeout=10.0)
-    except asyncio.TimeoutError:
-        print("Timeout: could not connect to Thymio")
-        return
-
-    await node.lock()
-    print(f"Connected to {node.id}")
+    client, node = await connect(kwargs)
     print("Press Ctrl+C to stop\n")
 
+    startup_done = False
     try:
-        await phase1_startup(node)
-        await phase2_escape(node, client)
-        await phase3_celebrate(node)
+        while True:
+            try:
+                if not startup_done:
+                    await phase1_startup(node)
+                    startup_done = True
+                await phase2_escape(node, client)
+                await phase3_celebrate(node)
+                return
+            except DisconnectedError:
+                print("\nTDM disconnected — reconnecting...")
+                client, node = await connect(kwargs)
+                startup_done = True
     except KeyboardInterrupt:
         print("\nStopped by user.")
-    except Exception as e:
-        print(f"\nError: {e}")
     finally:
         try:
             await set_motors(node, 0, 0)
@@ -179,6 +224,11 @@ async def run_thymio(robot_addr=None, robot_port=None, use_ws=False, use_zerocon
             await node.unlock()
         except Exception:
             pass
+        try:
+            client.close()
+        except Exception:
+            pass
+        print("Cleaned up.")
 
 
 if __name__ == "__main__":
